@@ -110,11 +110,22 @@
   }
 
   // ---------- Training loop ----------
+  // Fast training controls. 2000 episodes/min is the requested target.
+  // The target is a scheduler target; actual episode rate is limited by the
+  // PolyTrack physics worker and by how long each run takes.
+  const FAST_TRAINING_DEFAULTS = {
+    enabled: true,
+    targetEpisodesPerMinute: 2000,
+    minLoopDelayMs: 1,
+    maxLoopDelayMs: 16,
+    reportEveryMs: 5000,
+  };
+
   const Trainer = {
     brain: makeBrain(),
     bestBrain: null,
     bestReward: -Infinity,
-    mutationScale: 0.8,
+    mutationScale: 0.4,
     episode: 0,
     episodeReward: 0,
     lastCheckpoint: 0,
@@ -123,6 +134,17 @@
     running: true,
     carId: null,
     lastPos: null,
+
+    fastTraining: {
+      enabled: FAST_TRAINING_DEFAULTS.enabled,
+      targetEpisodesPerMinute: FAST_TRAINING_DEFAULTS.targetEpisodesPerMinute,
+      minLoopDelayMs: FAST_TRAINING_DEFAULTS.minLoopDelayMs,
+      maxLoopDelayMs: FAST_TRAINING_DEFAULTS.maxLoopDelayMs,
+      actualEpisodesPerMinute: 0,
+      totalEpisodesAtLastReport: 0,
+      lastRateReportTime: performance.now(),
+      lastEpisodeTime: performance.now(),
+    },
   };
 
   function groundedWheelCount(s) {
@@ -131,7 +153,9 @@
 
   function resetEpisode(s) {
     Trainer.episode++;
-    console.log(`[PolyAI] Episode ${Trainer.episode} ended. Reward: ${Trainer.episodeReward.toFixed(1)} | Best: ${Trainer.bestReward.toFixed(1)} | Noise: ${Trainer.mutationScale.toFixed(3)} | Known checkpoints: ${Object.keys(checkpointPositions).length}`);
+    Trainer.fastTraining.lastEpisodeTime = performance.now();
+
+    console.log(`[PolyAI] Episode ${Trainer.episode} ended. Reward: ${Trainer.episodeReward.toFixed(1)} | Best: ${Trainer.bestReward.toFixed(1)} | Noise: ${Trainer.mutationScale.toFixed(3)} | Rate: ${Trainer.fastTraining.actualEpisodesPerMinute.toFixed(1)}/min`);
 
     if (Trainer.episodeReward > Trainer.bestReward) {
       Trainer.bestReward = Trainer.episodeReward;
@@ -148,14 +172,69 @@
     Trainer.framesSinceProgress = 0;
     Trainer.lastPos = null;
 
-    if (Trainer.carId != null && !deadIds.has(Trainer.carId)) sendControl(Trainer.carId, { reset: true });
+    if (Trainer.carId != null) {
+      // reset must be sent before removing the id from the active set so the
+      // game's simulation worker receives it.
+      deadIds.delete(Trainer.carId);
+      sendControl(Trainer.carId, { reset: true });
+    }
+  }
+
+  function setFastTraining(enabled) {
+    Trainer.fastTraining.enabled = !!enabled;
+    console.log(`[PolyAI] Fast training ${Trainer.fastTraining.enabled ? 'ON' : 'OFF'} | target ${Trainer.fastTraining.targetEpisodesPerMinute}/min`);
+    restartTrainingLoop();
+  }
+
+  function setFastTrainingTarget(episodesPerMinute) {
+    const n = Number(episodesPerMinute);
+    if (!Number.isFinite(n) || n <= 0) throw new Error('Target episodes/minute must be greater than 0');
+    Trainer.fastTraining.targetEpisodesPerMinute = Math.max(1, Math.floor(n));
+    console.log(`[PolyAI] Fast-training target set to ${Trainer.fastTraining.targetEpisodesPerMinute}/min`);
+    restartTrainingLoop();
+  }
+
+  function getTrainingDelayMs() {
+    if (!Trainer.fastTraining.enabled) return 16;
+    // 60,000 / target is the theoretical time budget per episode. We use it
+    // only to keep the control loop aggressive; physics still runs in the
+    // simulation worker at its own speed.
+    const targetEpisodeMs = 60000 / Trainer.fastTraining.targetEpisodesPerMinute;
+    return Math.max(
+      Trainer.fastTraining.minLoopDelayMs,
+      Math.min(Trainer.fastTraining.maxLoopDelayMs, targetEpisodeMs / 4)
+    );
+  }
+
+  function updateEpisodeRate() {
+    const now = performance.now();
+    const elapsed = now - Trainer.fastTraining.lastRateReportTime;
+    if (elapsed >= Trainer.fastTraining.reportEveryMs) {
+      const episodes = Trainer.episode - Trainer.fastTraining.totalEpisodesAtLastReport;
+      Trainer.fastTraining.actualEpisodesPerMinute = episodes * 60000 / elapsed;
+      Trainer.fastTraining.totalEpisodesAtLastReport = Trainer.episode;
+      Trainer.fastTraining.lastRateReportTime = now;
+      console.log(`[PolyAI] Training rate: ${Trainer.fastTraining.actualEpisodesPerMinute.toFixed(1)}/min | target: ${Trainer.fastTraining.targetEpisodesPerMinute}/min | fast: ${Trainer.fastTraining.enabled}`);
+    }
   }
 
   let tick = 0;
-  setInterval(() => {
+  let trainingTimer = null;
+
+  function trainingStep() {
+    if (!Trainer.running) {
+      restartTrainingLoop();
+      return;
+    }
+
     tick++;
+    updateEpisodeRate();
+
     const ids = getCarIds();
-    if (!ids.length) return;
+    if (!ids.length) {
+      restartTrainingLoop();
+      return;
+    }
 
     const newestId = Math.max(...ids);
     if (Trainer.carId !== newestId) {
@@ -167,7 +246,10 @@
     }
 
     const s = state[Trainer.carId];
-    if (!s) return;
+    if (!s) {
+      restartTrainingLoop();
+      return;
+    }
 
     if (s.nextCheckpointIndex > Trainer.lastCheckpoint) {
       recordCheckpointIfNew(Trainer.lastCheckpoint, s.position);
@@ -184,10 +266,12 @@
 
     let checkpointAngle = 0, checkpointDist = 1;
     const target = checkpointPositions[s.nextCheckpointIndex];
+    let rawCheckpointDistance = null;
     if (target) {
       const tx = target.x - s.position.x;
       const tz = target.z - s.position.z;
       const tmag = Math.sqrt(tx * tx + tz * tz);
+      rawCheckpointDistance = tmag;
       checkpointDist = Math.min(tmag / 50, 1);
       if (tmag > 0.001) {
         const tdx = tx / tmag, tdz = tz / tmag;
@@ -209,107 +293,89 @@
     ];
 
     const out = forward(Trainer.brain, input);
-
-    // Output mapping:
-    // out[0] = unused
-    // out[1] = left
-    // out[2] = right
-    // out[3] = brake/reverse
-    //
-    // Accelerate continuously while the neural network
-    // chooses left/right steering and braking.
-    const left = out[1] > 0.15;
-    const right = out[2] > 0.15;
-
     const controls = {
       up: true,
-      left: left && !right,
-      right: right && !left,
+      left: out[1] > 0.15 && !(out[2] > 0.15),
+      right: out[2] > 0.15 && !(out[1] > 0.15),
       down: out[3] > 0.5,
       reset: false,
     };
     sendControl(Trainer.carId, controls);
 
+    // Reward actual progress toward the next checkpoint. No speed or angle
+    // reward is accumulated, so sitting still cannot build a huge score.
     if (s.nextCheckpointIndex > Trainer.lastCheckpoint) {
       Trainer.episodeReward += 100;
       Trainer.lastCheckpoint = s.nextCheckpointIndex;
+      Trainer.lastCheckpointDistance = null;
       Trainer.framesSinceProgress = 0;
-
-      const newTarget = checkpointPositions[s.nextCheckpointIndex];
-      if (newTarget) {
-        const dx = newTarget.x - s.position.x;
-        const dz = newTarget.z - s.position.z;
-        Trainer.lastCheckpointDistance = Math.sqrt(dx * dx + dz * dz);
+    } else if (rawCheckpointDistance != null) {
+      if (Trainer.lastCheckpointDistance == null) {
+        Trainer.lastCheckpointDistance = rawCheckpointDistance;
       } else {
-        Trainer.lastCheckpointDistance = null;
+        const improvement = Trainer.lastCheckpointDistance - rawCheckpointDistance;
+        const DEADZONE = 0.02;
+        if (improvement > DEADZONE) {
+          Trainer.episodeReward += Math.min(improvement * 1.0, 3);
+          Trainer.framesSinceProgress = 0;
+        } else if (improvement < -DEADZONE) {
+          Trainer.episodeReward += Math.max(improvement * 1.5, -4);
+          Trainer.framesSinceProgress++;
+        } else {
+          Trainer.framesSinceProgress++;
+        }
+        Trainer.lastCheckpointDistance = rawCheckpointDistance;
       }
     } else {
       Trainer.framesSinceProgress++;
-
-      if (target) {
-        const dx = target.x - s.position.x;
-        const dz = target.z - s.position.z;
-        const distance = Math.sqrt(dx * dx + dz * dz);
-
-        // Reward ONLY actual change in distance to the next checkpoint.
-        // No reward is given for angle, speed, or simply existing.
-        if (Trainer.lastCheckpointDistance == null) {
-          Trainer.lastCheckpointDistance = distance;
-        } else {
-          const improvement = Trainer.lastCheckpointDistance - distance;
-          const DEADZONE = 0.02;
-
-          if (improvement > DEADZONE) {
-            // Moving toward the checkpoint is strongly rewarded.
-            Trainer.episodeReward += Math.min(improvement * 1.0, 3);
-            Trainer.framesSinceProgress = 0;
-          } else if (improvement < -DEADZONE) {
-            // Moving away is punished more strongly than tiny physics noise.
-            Trainer.episodeReward += Math.max(improvement * 1.5, -4);
-          }
-          // Within the deadzone: no reward and no punishment.
-
-          Trainer.lastCheckpointDistance = distance;
-        }
-
-        // IMPORTANT: checkpointAngle is an input only. It gives ZERO reward.
-        // The only continuous reward here is measured distance progress.
-      }
     }
-    // No speed reward: speed alone must never create reward.
-    // Reward comes only from checkpoint progress, checkpoints, and finish.
-
-    // Restart when the AI stops making checkpoint progress.
-    const noProgressTooLong = Trainer.framesSinceProgress > 180;
-
-    // If reward has stalled for a while, restart and try a mutated brain.
-    const rewardStalled =
-      Trainer.framesSinceProgress > 120 &&
-      Trainer.episodeReward <= Trainer.bestReward;
 
     const stuckTooLong = Trainer.framesSinceProgress > 240;
-
-    if (noProgressTooLong || rewardStalled || stuckTooLong || s.finishFrames != null) {
+    if (stuckTooLong || s.finishFrames != null) {
       if (s.finishFrames != null) Trainer.episodeReward += 500;
-      deadIds.add(Trainer.carId);
       resetEpisode(s);
     }
 
-    if (tick % 60 === 0) {
-      console.log(`[PolyAI] car ${Trainer.carId} | speed ${Math.round(s.speedKmh)} | ckpt ${s.nextCheckpointIndex} | angle ${checkpointAngle.toFixed(2)} | controls ${JSON.stringify(controls)} | reward ${Trainer.episodeReward.toFixed(1)}`);
+    if (tick % 120 === 0) {
+      console.log(`[PolyAI] car ${Trainer.carId} | speed ${Math.round(s.speedKmh)} | ckpt ${s.nextCheckpointIndex} | angle ${checkpointAngle.toFixed(2)} | controls ${JSON.stringify(controls)} | reward ${Trainer.episodeReward.toFixed(1)} | rate ${Trainer.fastTraining.actualEpisodesPerMinute.toFixed(1)}/min`);
     }
-  }, 16);
+
+    restartTrainingLoop();
+  }
+
+  function restartTrainingLoop() {
+    if (trainingTimer !== null) {
+      clearTimeout(trainingTimer);
+      trainingTimer = null;
+    }
+    if (!Trainer.running) return;
+    trainingTimer = setTimeout(() => {
+      trainingTimer = null;
+      trainingStep();
+    }, getTrainingDelayMs());
+  }
+
+  restartTrainingLoop();
 
   window.PolyAI = {
     getState(carId) { return carId !== undefined ? state[carId] : state[Trainer.carId]; },
     getCarIds,
     Trainer,
     checkpointPositions,
-    pause() { Trainer.running = false; },
-    resume() { Trainer.running = true; },
+    pause() {
+      Trainer.running = false;
+      if (trainingTimer !== null) { clearTimeout(trainingTimer); trainingTimer = null; }
+    },
+    resume() {
+      Trainer.running = true;
+      restartTrainingLoop();
+    },
+    setFastTraining,
+    setFastTrainingTarget,
+    getTrainingRate() { return Trainer.fastTraining.actualEpisodesPerMinute; },
   };
 
-  console.log('[PolyAI] Training loop ready (v5: always accelerate, AI only picks steering).');
+  console.log(`[PolyAI] Training loop ready. Fast mode: ${Trainer.fastTraining.enabled}, target: ${Trainer.fastTraining.targetEpisodesPerMinute}/min. Use PolyAI.setFastTrainingTarget(2000) to change the target.`);
 })();
 </script>
 <script defer="defer" src="error_screen.bundle.js"></script><script defer="defer" src="main.bundle.js"></script></head><body><canvas id="screen"></canvas><div id="ui"></div><div id="transition-layer"></div></body></html>
